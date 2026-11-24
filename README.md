@@ -1,4 +1,4 @@
-# libapfs
+# libapfs ...but it works and uses a quicker b-tree traversal method
 
 <p align="left">
   <img src="./icon.svg" width="260" alt="libapfs">
