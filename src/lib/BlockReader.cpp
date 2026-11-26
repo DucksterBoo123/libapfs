@@ -1,32 +1,95 @@
+#include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <limits>
+#include <mutex>
 #include <libapfs/BlockReader.hpp>
 #include <libapfs/util.hpp>
 #include <memory>
-
 #ifdef _WIN32
+#include <Windows.h>
 #define apfs_fseek _fseeki64
 #else
 #define apfs_fseek fseeko
 #endif
 
 namespace apfs {
+namespace {
+// All readers can share the same CRT FILE*. Serialise the fallback seek/read
+// pair so simultaneous operations cannot move the shared file position.
+std::mutex fallback_io_mutex;
 
-// Read a block and return its raw bytes
+#ifdef _WIN32
+std::shared_ptr<void> open_overlapped_handle(const std::string &path) {
+  HANDLE h = CreateFileA(path.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return {};
+  return std::shared_ptr<void>(h, [](void *p) { CloseHandle(static_cast<HANDLE>(p)); });
+}
+
+void read_at(HANDLE h, uint64_t pos, char *dst, size_t length) {
+  // Per-request event: required for safe independent concurrent overlapped I/O.
+  HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!ev) throw Error("CreateEventW failed: " + std::to_string(GetLastError()));
+  try {
+    size_t completed = 0;
+    while (completed < length) {
+      // ReadFile accepts DWORD lengths, and 4MB is an intentionally bounded
+      // transfer size that avoids large driver allocations.
+      const DWORD chunk = static_cast<DWORD>(std::min<size_t>(length - completed, 4u * 1024u * 1024u));
+      const uint64_t at = pos + completed;
+      OVERLAPPED ov{};
+      ov.Offset = static_cast<DWORD>(at);
+      ov.OffsetHigh = static_cast<DWORD>(at >> 32);
+      ov.hEvent = ev;
+      ResetEvent(ev);
+      DWORD received = 0;
+      BOOL ok = ReadFile(h, dst + completed, chunk, &received, &ov);
+      if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(h, &ov, &received, TRUE);
+      }
+      if (!ok || received != chunk) {
+        const DWORD err = ok ? ERROR_HANDLE_EOF : GetLastError();
+        throw Error("ReadFile failed or returned short read at offset " + std::to_string(at) + ": " + std::to_string(err));
+      }
+      completed += received;
+    }
+  } catch (...) {
+    CloseHandle(ev);
+    throw;
+  }
+  CloseHandle(ev);
+}
+#endif
+}
+
 bytes_t BlockReader::read_block(uint64_t block_num) const {
-  int res = apfs_fseek(*f, block_num * BLOCK_SIZE + offset, SEEK_SET);
-  assert(res == 0);
-  bytes_t data(BLOCK_SIZE, 0);
-  res = fread((char *)data.data(), BLOCK_SIZE, 1, *f);
-  assert(res == 1);
-  return data;
+  return read_blocks(block_num, 1);
 }
 
 bytes_t BlockReader::read_blocks(uint64_t block_num, uint64_t num_blocks) const {
-  int res = apfs_fseek(*f, block_num * BLOCK_SIZE + offset, SEEK_SET);
-  assert(res == 0);
-  bytes_t data(num_blocks * BLOCK_SIZE, 0);
-  res = fread((char *)data.data(), BLOCK_SIZE, num_blocks, *f);
-  assert(res == num_blocks);
+  if (BLOCK_SIZE == 0 || num_blocks > (std::numeric_limits<size_t>::max)() / BLOCK_SIZE ||
+      block_num > ((std::numeric_limits<uint64_t>::max)() - offset) / BLOCK_SIZE) {
+    throw Error("invalid APFS block read bounds");
+  }
+  const size_t length = static_cast<size_t>(num_blocks * BLOCK_SIZE);
+  const uint64_t pos = block_num * BLOCK_SIZE + offset;
+  if (length > (std::numeric_limits<uint64_t>::max)() - pos) {
+    throw Error("APFS read range overflows physical offset");
+  }
+  bytes_t data(length, 0);
+  if (length == 0) return data;
+#ifdef _WIN32
+  if (native_handle) {
+    read_at(static_cast<HANDLE>(native_handle.get()), pos, data.data(), data.size());
+    return data;
+  }
+#endif
+  std::lock_guard<std::mutex> guard(fallback_io_mutex);
+  if (apfs_fseek(*f, pos, SEEK_SET) != 0 || fread(data.data(), 1, data.size(), *f) != data.size()) {
+    throw Error("APFS device read failed at byte offset " + std::to_string(pos));
+  }
   return data;
 }
 
@@ -46,13 +109,21 @@ BlockReader::BlockReader(std::string filename, bool apfs, uint64_t offset) : fil
     throw Error("could not open file " + filename + ": " + std::system_category().message(errno));
   }
 
+#ifdef _WIN32
+  native_handle = open_overlapped_handle(filename);
+  std::fprintf(stderr, "libapfs: offset I/O %s\n", native_handle ? "enabled" : "unavailable, using locked CRT fallback");
+#endif
   if (apfs) {
     set_apfs_block_size();
   }
 }
 
 BlockReader::BlockReader(const BlockReader &reader, bool apfs, uint64_t offset)
-    : f(reader.f), filename(reader.filename), offset(offset) {
+    : f(reader.f), offset(offset)
+#ifdef _WIN32
+    , native_handle(reader.native_handle)
+#endif
+    , filename(reader.filename) {
   if (apfs) {
     set_apfs_block_size();
   }
@@ -130,3 +201,4 @@ std::vector<x_field> BlockReader::parse_xfields(bytes_t &data) const {
 }
 
 } // namespace apfs
+

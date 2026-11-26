@@ -209,7 +209,11 @@ template <typename KeyType, typename Compare>
 template <typename Convert>
 key_value_t BTree<KeyType, Compare>::lower_bound(const bytes_t &k, const Convert &convert) const {
   if (lte(k, key_values[0].key)) {
-    return key_values[0];
+    if (is_leaf()) {
+      return key_values[0];
+    }
+    paddr_t addr = translate(cast<btn_index_node_val_t>(key_values[0].val).binv_child_oid, convert);
+    return reader.read_btree<KeyType>(addr, _lt).lower_bound(k, convert);
   }
   // Finds the current range (last kv.key <= k)
   int idx = std::find_if(key_values.begin(), key_values.end(), [&](const key_value_t &kv) { return lt(k, kv.key); }) - key_values.begin() - 1;
@@ -237,7 +241,11 @@ template <typename KeyType, typename Compare>
 template <typename Convert>
 key_value_t BTree<KeyType, Compare>::upper_bound(const bytes_t &k, const Convert &convert) const {
   if (lt(k, key_values[0].key)) {
-    return key_values[0];
+    if (is_leaf()) {
+      return key_values[0];
+    }
+    paddr_t addr = translate(cast<btn_index_node_val_t>(key_values[0].val).binv_child_oid, convert);
+    return reader.read_btree<KeyType>(addr, _lt).upper_bound(k, convert);
   }
   // Finds the current range
   int idx = std::find_if(key_values.begin(), key_values.end(), [&](const key_value_t &kv) { return lt(k, kv.key); }) - key_values.begin() - 1;

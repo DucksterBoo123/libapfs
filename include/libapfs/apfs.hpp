@@ -6,6 +6,8 @@
 #include "types/types.hpp"
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -69,6 +71,16 @@ class directory_entry {
   uint64_t inode_num;
   const volume *vol;
   BlockReader reader;
+  // Cache one extent per open file handle; copies share state.
+  struct extent_cache_state {
+    std::mutex mutex;
+    bool valid = false;
+    uint64_t private_id = 0;
+    uint64_t logical_start = 0;
+    uint64_t length = 0;
+    uint64_t physical_block = 0;
+  };
+  std::shared_ptr<extent_cache_state> extent_cache = std::make_shared<extent_cache_state>();
 
 public:
   /// The name of this directory entry. Note that this is not the full path.
@@ -90,7 +102,7 @@ public:
 
   /// @brief Reads the file represented by this entry iff it is a file (`DIRENT_FILE`).
   /// @throws If this entry does not represent a regular file, an error is thrown.
-  void read_file(std::ostream &os, off_t offset = 0, apfs_ssize_t size = -1) const;
+  void read_file(std::ostream &os, int64_t offset = 0, apfs_ssize_t size = -1) const;
 
   /// @brief Gets the path pointed to by this entry iff it is a symbolic link (`DIRENT_LINK`).
   /// @throws If this entry does not represent a symbolic link, an error is thrown.
@@ -216,3 +228,4 @@ public:
 };
 
 } // namespace apfs
+

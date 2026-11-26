@@ -282,14 +282,18 @@ directory_entry directory_entry::resolve(const std::string &path, bool follow_la
 inode_t directory_entry::load_inode() const {
   j_inode_key_t inode_key;
   inode_key.obj_id_and_type = (uint64_t(APFS_TYPE_INODE) << OBJ_TYPE_SHIFT) | inode_num;
-  auto inode_kv = vol->filesystem.lower_bound(to_bytes(inode_key), [&](const oid_t &oid) { return vol->get_paddr(oid); });
+  const bytes_t expected_key = to_bytes(inode_key);
+  auto inode_kv = vol->filesystem.lower_bound(expected_key, [&](const oid_t &oid) { return vol->get_paddr(oid); });
+  if (inode_kv == vol->filesystem.SENTINEL || inode_kv.key != expected_key) {
+    throw Error("inode not found: " + std::to_string(inode_num));
+  }
   j_inode_val_t inode_val = cast<j_inode_val_t>(inode_kv.val);
 
   std::vector<x_field> xfields = reader.parse_xfields(inode_val.xfields);
   return {inode_num, inode_val, xfields};
 }
 
-void directory_entry::read_file(std::ostream &os, off_t offset, apfs_ssize_t size) const {
+void directory_entry::read_file(std::ostream &os, int64_t offset, apfs_ssize_t size) const {
   if (type != DIRENT_FILE && type != DIRENT_LINK) {
     throw Error("\"" + name + "\" is not a file");
   }
@@ -297,67 +301,89 @@ void directory_entry::read_file(std::ostream &os, off_t offset, apfs_ssize_t siz
     throw Error("invalid size");
   }
 
-  inode_t inode_val = load_inode();
-  if (offset == inode_val.size) { // EOF
-    return;
-  }
-  if (offset < 0 || offset > inode_val.size) {
+  const inode_t inode_val = load_inode();
+  if (offset < 0 || uint64_t(offset) > uint64_t(inode_val.size)) {
     throw Error("invalid offset");
   }
+  if (uint64_t(offset) == uint64_t(inode_val.size)) return;
 
-  // This works because:
-  // this private_id == the object id of the file extents corresponding to this file
-  uint64_t private_id = inode_val.private_id;
+  const uint64_t private_id = inode_val.private_id;
+  const uint64_t bytes_available = uint64_t(inode_val.size) - uint64_t(offset);
+  uint64_t bytes_remaining = size == -1 ? bytes_available
+                                        : std::min(bytes_available, uint64_t(size));
+  uint64_t current_offset = uint64_t(offset);
+  constexpr uint64_t max_read_bytes = 4 * 1024 * 1024;
+  const uint64_t block_size = reader.BLOCK_SIZE;
+  if (block_size == 0) throw Error("invalid APFS block size");
 
-  // Get size of file
-  uint64_t size_remaining = size != -1 ? std::min(size, (apfs_ssize_t)(inode_val.size - offset)) : inode_val.size - offset;
-
-  // Find file extents
-  j_file_extent_key_t key;
-  key.logical_addr = offset;
-  key.obj_id_and_type = (uint64_t(APFS_TYPE_FILE_EXTENT) << OBJ_TYPE_SHIFT) | private_id;
-  auto kv = vol->filesystem.upper_bound(to_bytes(key), [&](const oid_t &oid) { return vol->get_paddr(oid); });
-  kv = vol->filesystem.prev(kv.key, [&](const oid_t &oid) { return vol->get_paddr(oid); });
-
-  bool first = true;
-  uint64_t skip_bytes;
-  while (size_remaining && kv != vol->filesystem.SENTINEL && (cast<j_key_t>(kv.key).obj_id_and_type >> OBJ_TYPE_SHIFT) == APFS_TYPE_FILE_EXTENT) {
-    j_file_extent_val_t val = cast<j_file_extent_val_t>(kv.val);
-
-    uint64_t addr = cast<j_file_extent_key_t>(kv.key).logical_addr;
-    uint64_t len = val.len_and_flags & J_FILE_EXTENT_LEN_MASK;
-
-    if (first) {
-      first = false;
-      skip_bytes = offset - addr;
-    }
-
-    // We don't know the max size of a file extent so we read it in chunks of at most 4MB
-    constexpr size_t buffer_size = 4 * 1024 * 1024;
-    size_t num_blocks = len / reader.BLOCK_SIZE;
-    uint64_t current_block = val.phys_block_num;
-    size_t blocks_remaining = num_blocks;
-
-    while (blocks_remaining > 0 && size_remaining > 0) {
-      size_t max_blocks_per_read = std::max(size_t(1), buffer_size / reader.BLOCK_SIZE);
-      size_t blocks_to_read = std::min(blocks_remaining, max_blocks_per_read);
-      bytes_t raw = reader.read_blocks(current_block, blocks_to_read);
-      if (skip_bytes >= raw.size()) {
-        skip_bytes -= raw.size();
-      } else {
-        size_t begin = skip_bytes;
-        skip_bytes = 0;
-        size_t available = raw.size() - begin;
-        size_t bytes_to_write = std::min(available, size_t(size_remaining));
-        os << raw.substr(begin, bytes_to_write);
-        size_remaining -= bytes_to_write;
+  while (bytes_remaining > 0) {
+    uint64_t logical_start = 0, extent_length = 0, physical_block = 0;
+    bool hit = false;
+    {
+      std::lock_guard<std::mutex> guard(extent_cache->mutex);
+      if (extent_cache->valid && extent_cache->private_id == private_id &&
+          current_offset >= extent_cache->logical_start &&
+          current_offset - extent_cache->logical_start < extent_cache->length) {
+        logical_start = extent_cache->logical_start;
+        extent_length = extent_cache->length;
+        physical_block = extent_cache->physical_block;
+        hit = true;
       }
-
-      current_block += blocks_to_read;
-      blocks_remaining -= blocks_to_read;
     }
 
-    kv = vol->filesystem.upper_bound(kv.key, [&](const oid_t &oid) { return vol->get_paddr(oid); });
+    if (!hit) {
+      j_file_extent_key_t key{};
+      key.logical_addr = current_offset;
+      key.obj_id_and_type = (uint64_t(APFS_TYPE_FILE_EXTENT) << OBJ_TYPE_SHIFT) | private_id;
+      auto kv = vol->filesystem.upper_bound(to_bytes(key), [&](const oid_t &oid) { return vol->get_paddr(oid); });
+      kv = vol->filesystem.prev(kv.key, [&](const oid_t &oid) { return vol->get_paddr(oid); });
+      if (kv == vol->filesystem.SENTINEL) throw Error("file extent not found");
+
+      const j_file_extent_key_t extent_key = cast<j_file_extent_key_t>(kv.key);
+      if (extent_key.obj_id_and_type != key.obj_id_and_type) {
+        throw Error("file extent belongs to another inode");
+      }
+      const j_file_extent_val_t extent_val = cast<j_file_extent_val_t>(kv.val);
+      logical_start = extent_key.logical_addr;
+      extent_length = extent_val.len_and_flags & J_FILE_EXTENT_LEN_MASK;
+      physical_block = extent_val.phys_block_num;
+      // Subtractions instead of start + length avoid 64-bit overflow.
+      if (extent_length == 0 || current_offset < logical_start ||
+          current_offset - logical_start >= extent_length) {
+        throw Error("invalid or missing file extent");
+      }
+      {
+        std::lock_guard<std::mutex> guard(extent_cache->mutex);
+        extent_cache->private_id = private_id;
+        extent_cache->logical_start = logical_start;
+        extent_cache->length = extent_length;
+        extent_cache->physical_block = physical_block;
+        extent_cache->valid = true;
+      }
+    }
+
+    const uint64_t offset_in_extent = current_offset - logical_start;
+    const uint64_t extent_bytes_remaining = extent_length - offset_in_extent;
+    uint64_t extent_output_remaining = std::min(bytes_remaining, extent_bytes_remaining);
+    uint64_t device_block = physical_block + offset_in_extent / block_size;
+    uint64_t start_in_block = offset_in_extent % block_size;
+
+    while (extent_output_remaining > 0) {
+      const uint64_t max_payload = max_read_bytes - start_in_block;
+      const uint64_t payload = std::min(extent_output_remaining, max_payload);
+      const uint64_t span = start_in_block + payload;
+      const size_t block_count = size_t(span / block_size + (span % block_size != 0));
+      if (block_count == 0) throw Error("empty block read");
+      bytes_t raw = reader.read_blocks(device_block, block_count);
+      if (raw.size() < span) throw Error("short APFS block read");
+      os.write(raw.data() + size_t(start_in_block), std::streamsize(payload));
+      if (!os) throw Error("failed to write file read data to output buffer");
+      device_block += block_count;
+      start_in_block = 0;
+      current_offset += payload;
+      extent_output_remaining -= payload;
+      bytes_remaining -= payload;
+    }
   }
 }
 

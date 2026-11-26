@@ -1,9 +1,39 @@
 #if defined(__linux__) || defined(_WIN32) || defined(_WIN64)
 
 #include "mount.hpp"
+#include <exception>
+#include <cstdio>
 
 namespace apfs {
 namespace fuse {
+
+// A bounded streambuf that writes directly to WinFsp's caller-provided buffer.
+// It removes the ostringstream -> string -> memcpy copies from every read.
+class read_output_buffer : public std::streambuf {
+  char *destination;
+  size_t capacity;
+  size_t written = 0;
+
+public:
+  read_output_buffer(char *buf, size_t len) : destination(buf), capacity(len) {}
+  size_t size() const { return written; }
+
+protected:
+  std::streamsize xsputn(const char *src, std::streamsize count) override {
+    if (count <= 0) return 0;
+    const size_t n = std::min(size_t(count), capacity - written);
+    if (n) memcpy(destination + written, src, n);
+    written += n;
+    return std::streamsize(n);
+  }
+
+  int_type overflow(int_type ch) override {
+    if (traits_type::eq_int_type(ch, traits_type::eof())) return traits_type::not_eof(ch);
+    if (written == capacity) return traits_type::eof();
+    destination[written++] = traits_type::to_char_type(ch);
+    return ch;
+  }
+};
 
 static void fill_timespec(apfs_timespec *spec, uint64_t ns) {
   spec->tv_sec = ns / int(1e9);
@@ -34,6 +64,9 @@ int apfs_fuse_open(const char *path, struct fuse_file_info *fi) {
     fi->fh = fd;
   } catch (const apfs::Error &e) {
     return -ENOENT;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "libapfs: open failed: %s\n", e.what());
+    return -EIO;
   }
 
   return 0;
@@ -57,6 +90,9 @@ int apfs_fuse_getattr(const char *path, apfs_stat *stbuf, struct fuse_file_info 
     res = 0;
   } catch (const apfs::Error &e) {
     res = -ENOENT;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "libapfs: filesystem operation failed: %s\n", e.what());
+    res = -EIO;
   }
 
   return res;
@@ -92,19 +128,19 @@ int apfs_fuse_read(const char *path, char *buf, size_t size, apfs_off_t offset, 
   int res;
 
   try {
-    std::ostringstream oss;
+    read_output_buffer output(buf, size);
+    std::ostream os(&output);
     if (fi && fi->fh) {
-      ctx->open_files->at(fi->fh).read_file(oss, offset, size);
+      ctx->open_files->at(fi->fh).read_file(os, offset, size);
     } else {
-      ctx->vol->navigate_to(std::string(path)).read_file(oss, offset, size);
+      ctx->vol->navigate_to(std::string(path)).read_file(os, offset, size);
     }
-
-    const std::string contents = oss.str();
-    const size_t len = std::min(size, contents.size());
-    memcpy(buf, contents.data(), len);
-    res = len;
+    res = int(output.size());
   } catch (const apfs::Error &e) {
     res = -ENOENT;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "libapfs: filesystem operation failed: %s\n", e.what());
+    res = -EIO;
   }
 
   return res;
@@ -133,6 +169,9 @@ int apfs_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler, apfs_
     }
   } catch (const apfs::Error &e) {
     return -ENOENT;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "libapfs: directory enumeration failed: %s\n", e.what());
+    return -EIO;
   }
 
   return 0;
